@@ -59,7 +59,6 @@ type call struct {
 	// not written after the WaitGroup is done.
 	dups  int
 	chans []chan<- Result
-	key   string
 }
 
 // Group represents a class of work and forms a namespace in
@@ -77,35 +76,6 @@ type Result struct {
 	Shared bool
 }
 
-type Option struct {
-	cleaner time.Duration
-}
-
-func NewGroup(opt ...Option) *Group {
-	g := new(Group)
-	if len(opt) > 0 && opt[0].cleaner != 0 {
-		t := time.NewTimer(opt[0].cleaner)
-		go func() {
-			for range t.C {
-				g.mu.Lock()
-				if g.m != nil {
-					keyMap := make(map[string]struct{})
-					for _, v := range g.m {
-						if _, ok := keyMap[v.key]; ok {
-							continue
-						} else {
-							keyMap[v.key] = struct{}{}
-							delete(g.m, v.key)
-						}
-					}
-				}
-				g.mu.Unlock()
-			}
-		}()
-	}
-	return g
-}
-
 // Do executes and returns the results of the given function, making
 // sure that only one execution is in-flight for a given key at a
 // time. If a duplicate comes in, the duplicate caller waits for the
@@ -118,7 +88,6 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (v interface{}, e
 	}
 	if c, ok := g.m[key]; ok {
 		c.dups++
-		c.key = key
 		g.mu.Unlock()
 		c.wg.Wait()
 
@@ -132,7 +101,33 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (v interface{}, e
 	c := new(call)
 	c.wg.Add(1)
 	g.m[key] = c
-	c.key = key
+	g.mu.Unlock()
+
+	g.doCall(c, key, fn)
+	return c.val, c.err, c.dups > 0
+}
+
+func (g *Group) DoWithTimer(key string, fn func() (interface{}, error), timer time.Duration) (v interface{}, err error, shared bool) {
+	g.triggerForget(key, timer)
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[string]*call)
+	}
+	if c, ok := g.m[key]; ok {
+		c.dups++
+		g.mu.Unlock()
+		c.wg.Wait()
+
+		if e, ok := c.err.(*panicError); ok {
+			panic(e)
+		} else if c.err == errGoexit {
+			runtime.Goexit()
+		}
+		return c.val, c.err, true
+	}
+	c := new(call)
+	c.wg.Add(1)
+	g.m[key] = c
 	g.mu.Unlock()
 
 	g.doCall(c, key, fn)
@@ -144,6 +139,29 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (v interface{}, e
 //
 // The returned channel will not be closed.
 func (g *Group) DoChan(key string, fn func() (interface{}, error)) <-chan Result {
+	ch := make(chan Result, 1)
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = make(map[string]*call)
+	}
+	if c, ok := g.m[key]; ok {
+		c.dups++
+		c.chans = append(c.chans, ch)
+		g.mu.Unlock()
+		return ch
+	}
+	c := &call{chans: []chan<- Result{ch}}
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	go g.doCall(c, key, fn)
+
+	return ch
+}
+
+func (g *Group) DoChanWithTimer(key string, fn func() (interface{}, error), timer time.Duration) <-chan Result {
+	g.triggerForget(key, timer)
 	ch := make(chan Result, 1)
 	g.mu.Lock()
 	if g.m == nil {
@@ -227,6 +245,17 @@ func (g *Group) doCall(c *call, key string, fn func() (interface{}, error)) {
 	if !normalReturn {
 		recovered = true
 	}
+}
+
+func (g *Group) triggerForget(key string, timer time.Duration) {
+	go func() {
+		t := time.NewTicker(timer)
+		for _ = range t.C {
+			if g.m != nil {
+				g.Forget(key)
+			}
+		}
+	}()
 }
 
 // Forget tells the singleflight to forget about a key.  Future calls
