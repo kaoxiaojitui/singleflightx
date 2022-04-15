@@ -253,6 +253,7 @@ func (g *Group) triggerForget(key string, timer time.Duration) {
 		for _ = range t.C {
 			if g.m != nil {
 				g.Forget(key)
+				return
 			}
 		}
 	}()
