@@ -108,7 +108,6 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (v interface{}, e
 }
 
 func (g *Group) DoWithTimer(key string, fn func() (interface{}, error), timer time.Duration) (v interface{}, err error, shared bool) {
-	g.triggerForget(key, timer)
 	g.mu.Lock()
 	if g.m == nil {
 		g.m = make(map[string]*call)
@@ -128,6 +127,7 @@ func (g *Group) DoWithTimer(key string, fn func() (interface{}, error), timer ti
 	c := new(call)
 	c.wg.Add(1)
 	g.m[key] = c
+	g.triggerForget(key, timer)
 	g.mu.Unlock()
 
 	g.doCall(c, key, fn)
@@ -161,7 +161,6 @@ func (g *Group) DoChan(key string, fn func() (interface{}, error)) <-chan Result
 }
 
 func (g *Group) DoChanWithTimer(key string, fn func() (interface{}, error), timer time.Duration) <-chan Result {
-	g.triggerForget(key, timer)
 	ch := make(chan Result, 1)
 	g.mu.Lock()
 	if g.m == nil {
@@ -176,6 +175,7 @@ func (g *Group) DoChanWithTimer(key string, fn func() (interface{}, error), time
 	c := &call{chans: []chan<- Result{ch}}
 	c.wg.Add(1)
 	g.m[key] = c
+	g.triggerForget(key, timer)
 	g.mu.Unlock()
 
 	go g.doCall(c, key, fn)
@@ -249,8 +249,9 @@ func (g *Group) doCall(c *call, key string, fn func() (interface{}, error)) {
 
 func (g *Group) triggerForget(key string, timer time.Duration) {
 	go func() {
-		t := time.NewTicker(timer)
-		for _ = range t.C {
+		t := time.NewTimer(timer)
+		select {
+		case <-t.C:
 			if g.m != nil {
 				g.Forget(key)
 				return
